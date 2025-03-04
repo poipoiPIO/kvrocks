@@ -27,6 +27,7 @@
 #include <string_view>
 #include <vector>
 
+#include "fmt/format.h"
 #include "rocksdb/status.h"
 #include "status.h"
 #include "string_util.h"
@@ -49,7 +50,7 @@ std::string StatusToRedisErrorMsg(const Status &s);
 
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 std::string Integer(T data) {
-  return ":" + std::to_string(data) + CRLF;
+  return fmt::format(":{}" CRLF, std::to_string(data));
 }
 
 inline std::string NilString(RESP ver) {
@@ -63,7 +64,7 @@ std::string BulkString(const std::string &data);
 
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 std::string MultiLen(T len) {
-  return "*" + std::to_string(len) + CRLF;
+  return fmt::format("*{}" CRLF, std::to_string(len));
 }
 
 std::string Array(const std::vector<std::string> &list);
@@ -71,10 +72,10 @@ std::string ArrayOfBulkStrings(const std::vector<std::string> &elements);
 
 std::string Bool(RESP ver, bool b);
 inline std::string BigNumber(RESP ver, const std::string &n) {
-  return ver == RESP::v3 ? "(" + n + CRLF : BulkString(n);
+  return ver == RESP::v3 ? fmt::format("({}" CRLF, n) : BulkString(n);
 }
 inline std::string Double(RESP ver, double d) {
-  return ver == RESP::v3 ? "," + util::Float2String(d) + CRLF : BulkString(util::Float2String(d));
+  return ver == RESP::v3 ? fmt::format(",{}" CRLF, util::Float2String(d)) : BulkString(util::Float2String(d));
 }
 // ext is the extension of file to send, 'txt' for text file, 'md ' for markdown file
 // at most 3 chars, padded with space
@@ -83,8 +84,7 @@ inline std::string Double(RESP ver, double d) {
 inline std::string VerbatimString(RESP ver, std::string ext, const std::string &data) {
   CHECK(ext.size() <= 3);
   size_t padded_len = 3 - ext.size();
-  ext = ext + std::string(padded_len, ' ');
-  return ver == RESP::v3 ? "=" + std::to_string(3 + 1 + data.size()) + CRLF + ext + ":" + data + CRLF
+  return ver == RESP::v3 ? fmt::format("={}" CRLF "{}{}:{}" CRLF, std::to_string(3 + 1 + data.size()),  ext,std::string(padded_len, ' '), data)
                          : BulkString(data);
 }
 
@@ -95,22 +95,22 @@ std::string MultiBulkString(RESP ver, const std::vector<std::string> &values,
 
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 std::string HeaderOfSet(RESP ver, T len) {
-  return ver == RESP::v3 ? "~" + std::to_string(len) + CRLF : MultiLen(len);
+  return ver == RESP::v3 ? fmt::format("~{}" CRLF, std::to_string(len)) : MultiLen(len);
 }
 std::string SetOfBulkStrings(RESP ver, const std::vector<std::string> &elems);
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 std::string HeaderOfMap(RESP ver, T len) {
-  return ver == RESP::v3 ? "%" + std::to_string(len) + CRLF : MultiLen(len * 2);
+  return ver == RESP::v3 ? fmt::format("%{}" CRLF, std::to_string(len)) : MultiLen(len * 2);
 }
 std::string Map(RESP ver, const std::map<std::string, std::string> &map);
 std::string MapOfBulkStrings(RESP ver, const std::vector<std::string> &elems);
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 std::string HeaderOfAttribute(T len) {
-  return "|" + std::to_string(len) + CRLF;
+  return fmt::format("|{}" CRLF, std::to_string(len));
 }
 template <typename T, std::enable_if_t<std::is_integral_v<T>, int> = 0>
 std::string HeaderOfPush(RESP ver, T len) {
-  return ver == RESP::v3 ? ">" + std::to_string(len) + CRLF : MultiLen(len);
+  return ver == RESP::v3 ? fmt::format(">{}" CRLF, std::to_string(len)) : MultiLen(len);
 }
 
 }  // namespace redis
