@@ -33,6 +33,7 @@
 #include "types/redis_stream.h"
 
 namespace redis {
+
 namespace {
 // for XRead and XReadGroup stream range parse.
 CommandKeyRange ParseStreamReadRange(const std::vector<std::string> &args, uint32_t start_offset) {
@@ -49,6 +50,15 @@ CommandKeyRange ParseStreamReadRange(const std::vector<std::string> &args, uint3
   return range;
 }
 }  // namespace
+
+void AddStreamEntriesToResponse(std::string *output, const std::vector<StreamEntry> &entries) {
+  output->append(redis::MultiLen(entries.size()));
+  for (const auto &entry : entries) {
+    output->append(redis::MultiLen(2));
+    output->append(redis::BulkString(entry.key));
+    output->append(redis::ArrayOfBulkStrings(entry.values));
+  }
+}
 
 class CommandXAck : public Commander {
  public:
@@ -349,13 +359,7 @@ class CommandXClaim : public Commander {
     }
 
     if (!stream_claim_options_.just_id) {
-      output->append(redis::MultiLen(result.entries.size()));
-
-      for (const auto &e : result.entries) {
-        output->append(redis::MultiLen(2));
-        output->append(redis::BulkString(e.key));
-        output->append(conn->MultiBulkString(e.values));
-      }
+      AddStreamEntriesToResponse(output, result.entries);
     } else {
       output->append(redis::MultiLen(result.ids.size()));
       for (const auto &id : result.ids) {
@@ -444,18 +448,13 @@ class CommandAutoClaim : public Commander {
                      std::string *output) const {
     output->append(redis::MultiLen(3));
     output->append(redis::BulkString(result.next_claim_id));
-    output->append(redis::MultiLen(result.entries.size()));
-    for (const auto &item : result.entries) {
-      if (options_.just_id) {
+    if (options_.just_id) {
+      output->append(redis::MultiLen(result.entries.size()));
+      for (const auto &item : result.entries) {
         output->append(redis::BulkString(item.key));
-      } else {
-        output->append(redis::MultiLen(2));
-        output->append(redis::BulkString(item.key));
-        output->append(redis::MultiLen(item.values.size()));
-        for (const auto &value_item : item.values) {
-          output->append(redis::BulkString(value_item));
-        }
       }
+    } else {
+      AddStreamEntriesToResponse(output, result.entries);
     }
 
     output->append(redis::MultiLen(result.deleted_ids.size()));
@@ -767,12 +766,7 @@ class CommandXInfo : public Commander {
       }
     } else {
       output->append(redis::BulkString("entries"));
-      output->append(redis::MultiLen(info.entries.size()));
-      for (const auto &e : info.entries) {
-        output->append(redis::MultiLen(2));
-        output->append(redis::BulkString(e.key));
-        output->append(conn->MultiBulkString(e.values));
-      }
+      AddStreamEntriesToResponse(output, info.entries);
     }
 
     return Status::OK();
@@ -1030,13 +1024,7 @@ class CommandXRange : public Commander {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    output->append(redis::MultiLen(result.size()));
-
-    for (const auto &e : result) {
-      output->append(redis::MultiLen(2));
-      output->append(redis::BulkString(e.key));
-      output->append(conn->MultiBulkString(e.values));
-    }
+    AddStreamEntriesToResponse(output, result);
 
     return Status::OK();
   }
@@ -1124,13 +1112,7 @@ class CommandXRevRange : public Commander {
       return {Status::RedisExecErr, s.ToString()};
     }
 
-    output->append(redis::MultiLen(result.size()));
-
-    for (const auto &e : result) {
-      output->append(redis::MultiLen(2));
-      output->append(redis::BulkString(e.key));
-      output->append(conn->MultiBulkString(e.values));
-    }
+    AddStreamEntriesToResponse(output, result);
 
     return Status::OK();
   }
@@ -1273,21 +1255,17 @@ class CommandXRead : public Commander,
       return Status::OK();
     }
 
-    return SendResults(conn, output, results);
+    return SendResults(output, results);
   }
 
-  static Status SendResults(Connection *conn, std::string *output, const std::vector<StreamReadResult> &results) {
+  static Status SendResults(std::string *output, const std::vector<StreamReadResult> &results) {
     output->append(redis::MultiLen(results.size()));
 
     for (const auto &result : results) {
       output->append(redis::MultiLen(2));
       output->append(redis::BulkString(result.name));
-      output->append(redis::MultiLen(result.entries.size()));
-      for (const auto &entry : result.entries) {
-        output->append(redis::MultiLen(2));
-        output->append(redis::BulkString(entry.key));
-        output->append(conn->MultiBulkString(entry.values));
-      }
+
+      AddStreamEntriesToResponse(output, result.entries);
     }
 
     return Status::OK();
@@ -1387,12 +1365,8 @@ class CommandXRead : public Commander,
     for (const auto &result : results) {
       output.append(redis::MultiLen(2));
       output.append(redis::BulkString(result.name));
-      output.append(redis::MultiLen(result.entries.size()));
-      for (const auto &entry : result.entries) {
-        output.append(redis::MultiLen(2));
-        output.append(redis::BulkString(entry.key));
-        output.append(conn_->MultiBulkString(entry.values));
-      }
+
+      AddStreamEntriesToResponse(&output, result.entries);
     }
 
     conn_->Reply(output);
@@ -1702,12 +1676,7 @@ class CommandXReadGroup : public Commander,
     for (const auto &result : results) {
       output.append(redis::MultiLen(2));
       output.append(redis::BulkString(result.name));
-      output.append(redis::MultiLen(result.entries.size()));
-      for (const auto &entry : result.entries) {
-        output.append(redis::MultiLen(2));
-        output.append(redis::BulkString(entry.key));
-        output.append(conn_->MultiBulkString(entry.values));
-      }
+      AddStreamEntriesToResponse(&output, result.entries);
     }
 
     conn_->Reply(output);

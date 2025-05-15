@@ -18,7 +18,6 @@
  *
  */
 
-#include <glog/logging.h>
 #include <rocksdb/iostats_context.h>
 #include <rocksdb/perf_context.h>
 
@@ -28,6 +27,7 @@
 #include "commands/commander.h"
 #include "commands/error_constants.h"
 #include "fmt/format.h"
+#include "logging.h"
 #include "nonstd/span.hpp"
 #include "search/indexer.h"
 #include "server/redis_reply.h"
@@ -89,7 +89,7 @@ void Connection::OnRead([[maybe_unused]] struct bufferevent *bev) {
   if (!s.IsOK()) {
     EnableFlag(redis::Connection::kCloseAfterReply);
     Reply(redis::Error(s));
-    LOG(INFO) << "[connection] Failed to tokenize the request. Error: " << s.Msg();
+    info("[connection] Failed to tokenize the request. Error: {}", s.Msg());
     return;
   }
 
@@ -107,29 +107,38 @@ void Connection::OnWrite([[maybe_unused]] bufferevent *bev) {
 
 void Connection::OnEvent(bufferevent *bev, int16_t events) {
   if (events & BEV_EVENT_ERROR) {
-    LOG(ERROR) << "[connection] Going to remove the client: " << GetAddr()
-               << ", while encounter error: " << evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR())
 #ifdef ENABLE_OPENSSL
-               << ", SSL Error: " << SSLError(bufferevent_get_openssl_error(bev))  // NOLINT
+    error("[connection] Removing client: {}, error: {}, SSL Error: {}", GetAddr(),
+          evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()),
+          fmt::streamed(SSLError(bufferevent_get_openssl_error(bev))));  // NOLINT
+#else
+    error("[connection] Removing client: {}, error: {}", GetAddr(),
+          evutil_socket_error_to_string(EVUTIL_SOCKET_ERROR()));
 #endif
-        ;  // NOLINT
     Close();
     return;
   }
 
   if (events & BEV_EVENT_EOF) {
-    DLOG(INFO) << "[connection] Going to remove the client: " << GetAddr() << ", while closed by client";
+    debug("[connection] Going to remove the client: {}, while closed by client", GetAddr());
     Close();
     return;
   }
 
   if (events & BEV_EVENT_TIMEOUT) {
-    DLOG(INFO) << "[connection] The client: " << GetAddr() << "] reached timeout";
+    debug("[connection] The client: {} reached timeout", GetAddr());
     bufferevent_enable(bev, EV_READ | EV_WRITE);
   }
 }
 
 void Connection::Reply(const std::string &msg) {
+  if (reply_mode_ == ReplyMode::SKIP) {
+    reply_mode_ = ReplyMode::ON;
+    return;
+  }
+  if (reply_mode_ == ReplyMode::OFF) {
+    return;
+  }
   owner_->srv->stats.IncrOutboundBytes(msg.size());
   redis::Reply(bufferevent_get_output(bev_), msg);
 }
@@ -373,7 +382,7 @@ static bool IsCmdAllowedInStaleData(const std::string &cmd_name) {
 void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
   const Config *config = srv_->GetConfig();
   std::string reply;
-  std::string password = config->requirepass;
+  const std::string &password = config->requirepass;
 
   while (!to_process_cmds->empty()) {
     CommandTokens cmd_tokens = std::move(to_process_cmds->front());
@@ -387,8 +396,9 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
     if (!cmd_s.IsOK()) {
       auto cmd_name = cmd_tokens.front();
       if (util::EqualICase(cmd_name, "host:") || util::EqualICase(cmd_name, "post")) {
-        LOG(WARNING) << "A likely HTTP request is detected in the RESP connection, indicating a potential "
-                        "Cross-Protocol Scripting attack. Connection aborted.";
+        warn(
+            "[connection] A likely HTTP request is detected in the RESP connection, indicating a potential "
+            "Cross-Protocol Scripting attack. Connection aborted.");
         EnableFlag(kCloseAsync);
         return;
       }
@@ -540,7 +550,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
                     if (res.IsOK()) {
                       index_records.push_back(*res);
                     } else if (!res.Is<Status::NoPrefixMatched>() && !res.Is<Status::TypeMismatched>()) {
-                      LOG(WARNING) << "index recording failed for key: " << key;
+                      warn("[connection] index recording failed for key: {}", key);
                     }
                   },
                   args);
@@ -552,7 +562,7 @@ void Connection::ExecuteCommands(std::deque<CommandTokens> *to_process_cmds) {
       for (const auto &record : index_records) {
         auto s = GlobalIndexer::Update(ctx, record);
         if (!s.IsOK() && !s.Is<Status::TypeMismatched>()) {
-          LOG(WARNING) << "index updating failed for key: " << record.key;
+          warn("[connection] index updating failed for key: {}", record.key);
         }
       }
     }

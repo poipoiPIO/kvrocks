@@ -22,6 +22,7 @@
 
 #include <fmt/format.h>
 #include <rocksdb/env.h>
+#include <spdlog/spdlog.h>
 #include <strings.h>
 
 #include <cstddef>
@@ -59,13 +60,6 @@ const std::vector<ConfigEnum<SupervisedMode>> supervised_modes{
     {"systemd", kSupervisedSystemd},
 };
 
-const std::vector<ConfigEnum<int>> log_levels{
-    {"info", google::INFO},
-    {"warning", google::WARNING},
-    {"error", google::ERROR},
-    {"fatal", google::FATAL},
-};
-
 const std::vector<ConfigEnum<JsonStorageFormat>> json_storage_formats{{"json", JsonStorageFormat::JSON},
                                                                       {"cbor", JsonStorageFormat::CBOR}};
 
@@ -100,8 +94,9 @@ const std::vector<ConfigEnum<MigrationType>> migration_types{{"redis-command", M
                                                              {"raw-key-value", MigrationType::kRawKeyValue}};
 
 std::string TrimRocksDbPrefix(std::string s) {
-  if (strncasecmp(s.data(), "rocksdb.", 8) != 0) return s;
-  return s.substr(8, s.size() - 8);
+  constexpr std::string_view prefix = "rocksdb.";
+  if (!util::StartsWithICase(s, prefix)) return s;
+  return s.substr(prefix.size());
 }
 
 Status SetRocksdbCompression(Server *srv, const rocksdb::CompressionType compression,
@@ -192,7 +187,7 @@ Config::Config() {
       {"dir", true, new StringField(&dir, kDefaultDir)},
       {"backup-dir", false, new StringField(&backup_dir, kDefaultBackupDir)},
       {"log-dir", true, new StringField(&log_dir, "")},
-      {"log-level", false, new EnumField<int>(&log_level, log_levels, google::INFO)},
+      {"log-level", false, new EnumField<spdlog::level::level_enum>(&log_level, log_levels, spdlog::level::info)},
       {"pidfile", true, new StringField(&pidfile, kDefaultPidfile)},
       {"max-io-mb", false, new IntField(&max_io_mb, 0, 0, INT_MAX)},
       {"max-bitmap-to-string-mb", false, new IntField(&max_bitmap_to_string_mb, 16, 0, INT_MAX)},
@@ -213,6 +208,9 @@ Config::Config() {
       {"slowlog-log-slower-than", false, new IntField(&slowlog_log_slower_than, 200000, -1, INT_MAX)},
       {"profiling-sample-commands", false, new StringField(&profiling_sample_commands_str_, "")},
       {"slowlog-max-len", false, new IntField(&slowlog_max_len, 128, 0, INT_MAX)},
+      {"slowlog-dump-logfile-level", false,
+       new EnumField<spdlog::level::level_enum>(&slowlog_dump_logfile_level, slowlog_dump_logfile_levels,
+                                                spdlog::level::off)},
       {"purge-backup-on-fullsync", false, new YesNoField(&purge_backup_on_fullsync, false)},
       {"rename-command", true, new MultiStringField(&rename_command_, std::vector<std::string>{})},
       {"auto-resize-block-and-sst", false, new YesNoField(&auto_resize_block_and_sst, true)},
@@ -227,7 +225,7 @@ Config::Config() {
       {"migrate-batch-rate-limit-mb", false, new IntField(&migrate_batch_rate_limit_mb, 16, 0, INT_MAX)},
       {"unixsocket", true, new StringField(&unixsocket, "")},
       {"unixsocketperm", true, new OctalField(&unixsocketperm, 0777, 1, INT_MAX)},
-      {"log-retention-days", false, new IntField(&log_retention_days, -1, -1, INT_MAX)},
+      {"log-retention-days", true, new IntField(&log_retention_days, -1, -1, INT_MAX)},
       {"persist-cluster-nodes-enabled", false, new YesNoField(&persist_cluster_nodes_enabled, true)},
       {"redis-cursor-compatible", false, new YesNoField(&redis_cursor_compatible, true)},
       {"resp3-enabled", false, new YesNoField(&resp3_enabled, true)},
@@ -475,7 +473,7 @@ void Config::initFieldCallback() {
        [this]([[maybe_unused]] Server *srv, [[maybe_unused]] const std::string &k,
               [[maybe_unused]] const std::string &v) -> Status {
          db_dir = dir + "/db";
-         if (log_dir.empty()) log_dir = dir;
+         if (log_dir.empty()) log_dir = dir + ",stdout";
          checkpoint_dir = dir + "/checkpoint";
          sync_checkpoint_dir = dir + "/sync_checkpoint";
          backup_sync_dir = dir + "/backup_for_sync";
@@ -494,8 +492,8 @@ void Config::initFieldCallback() {
            backup_dir = v;
          }
          if (!previous_backup.empty() && srv != nullptr && !srv->IsLoading()) {
-           // LOG(INFO) should be called after log is initialized and server is loaded.
-           LOG(INFO) << "change backup dir from " << previous_backup << " to " << v;
+           // info() should be called after log is initialized and server is loaded.
+           info("change backup dir from {} to {}", previous_backup, v);
          }
          return Status::OK();
        }},
@@ -542,6 +540,12 @@ void Config::initFieldCallback() {
        [this](Server *srv, [[maybe_unused]] const std::string &k, [[maybe_unused]] const std::string &v) -> Status {
          if (!srv) return Status::OK();
          srv->GetSlowLog()->SetMaxEntries(slowlog_max_len);
+         return Status::OK();
+       }},
+      {"slowlog-dump-logfile-level",
+       [this](Server *srv, [[maybe_unused]] const std::string &k, [[maybe_unused]] const std::string &v) -> Status {
+         if (!srv) return Status::OK();
+         srv->GetSlowLog()->SetDumpToLogfileLevel(slowlog_dump_logfile_level);
          return Status::OK();
        }},
       {"max-db-size",
@@ -595,21 +599,7 @@ void Config::initFieldCallback() {
       {"log-level",
        [this](Server *srv, [[maybe_unused]] const std::string &k, [[maybe_unused]] const std::string &v) -> Status {
          if (!srv) return Status::OK();
-         FLAGS_minloglevel = log_level;
-         return Status::OK();
-       }},
-      {"log-retention-days",
-       [this](Server *srv, [[maybe_unused]] const std::string &k, [[maybe_unused]] const std::string &v) -> Status {
-         if (!srv) return Status::OK();
-         if (util::ToLower(log_dir) == "stdout") {
-           return {Status::NotOK, "can't set the 'log-retention-days' when the log dir is stdout"};
-         }
-
-         if (log_retention_days != -1) {
-           google::EnableLogCleaner(std::chrono::hours(24) * log_retention_days);
-         } else {
-           google::DisableLogCleaner();
-         }
+         spdlog::set_level(log_level);
          return Status::OK();
        }},
       {"persist-cluster-nodes-enabled",
@@ -794,7 +784,7 @@ void Config::SetMaster(const std::string &host, uint32_t port) {
   if (iter != fields_.end()) {
     auto s = iter->second->Set(master_host + " " + std::to_string(master_port));
     if (!s.IsOK()) {
-      LOG(ERROR) << "Failed to set the value of 'slaveof' setting: " << s.Msg();
+      error("Failed to set the value of 'slaveof' setting: {}", s.Msg());
     }
   }
 }
@@ -806,19 +796,18 @@ void Config::ClearMaster() {
   if (iter != fields_.end()) {
     auto s = iter->second->Set("no one");
     if (!s.IsOK()) {
-      LOG(ERROR) << "Failed to clear the value of 'slaveof' setting: " << s.Msg();
+      error("Failed to clear the value of 'slaveof' setting: {}", s.Msg());
     }
   }
 }
 
 Status Config::parseConfigFromPair(const std::pair<std::string, std::string> &input, int line_number) {
   std::string field_key = util::ToLower(input.first);
-  constexpr const char ns_str[] = "namespace.";
-  size_t ns_str_size = sizeof(ns_str) - 1;
-  if (strncasecmp(input.first.data(), ns_str, ns_str_size) == 0) {
+  constexpr std::string_view ns_str = "namespace.";
+  if (util::StartsWithICase(input.first, ns_str)) {
     // namespace should keep key case-sensitive
     field_key = input.first;
-    load_tokens[input.second] = input.first.substr(ns_str_size);
+    load_tokens[input.second] = input.first.substr(ns_str.size());
     return Status::OK();
   }
 
@@ -900,8 +889,8 @@ Status Config::Load(const CLIOptions &opts) {
       line_num++;
     }
   } else {
-    std::cout << "WARNING: No config file specified, using the default configuration. "
-              << "In order to specify a config file use 'kvrocks -c /path/to/kvrocks.conf'" << std::endl;
+    std::cout << "WARNING: No config file specified, default configuration applied. "
+              << "In order to specify a config file, use `kvrocks -c /path/to/kvrocks.conf`." << std::endl;
   }
 
   for (const auto &opt : opts.cli_options) {
@@ -1017,7 +1006,7 @@ Status Config::Rewrite(const std::map<std::string, std::string> &tokens) {
         continue;
       }
       auto kv = std::move(*parsed);
-      if (util::HasPrefix(kv.first, namespace_prefix)) {
+      if (util::StartsWith(kv.first, namespace_prefix)) {
         // Ignore namespace fields here since we would always rewrite them
         continue;
       }

@@ -161,6 +161,9 @@ rocksdb::Status TDigest::Add(engine::Context& ctx, const Slice& digest_name, con
 
   metadata.total_observations += inputs.size();
   metadata.total_weight += inputs.size();
+  auto [buffer_min, buffer_max] = std::minmax_element(inputs.cbegin(), inputs.cend());
+  metadata.maximum = std::max(metadata.maximum, *buffer_max);
+  metadata.minimum = std::min(metadata.minimum, *buffer_min);
 
   if (metadata.unmerged_nodes + inputs.size() <= metadata.capacity) {
     if (auto status = appendBuffer(ctx, batch, ns_key, inputs, &metadata); !status.ok()) {
@@ -235,7 +238,45 @@ rocksdb::Status TDigest::Quantile(engine::Context& ctx, const Slice& digest_name
 
   return rocksdb::Status::OK();
 }
+rocksdb::Status TDigest::Reset(engine::Context& ctx, const Slice& digest_name) {
+  auto ns_key = AppendNamespacePrefix(digest_name);
 
+  TDigestMetadata metadata;
+  if (auto status = getMetaDataByNsKey(ctx, ns_key, &metadata); !status.ok()) {
+    return status;
+  }
+
+  auto batch = storage_->GetWriteBatchBase();
+  WriteBatchLogData log_data(kRedisTDigest);
+  if (auto status = batch->PutLogData(log_data.Encode()); !status.ok()) {
+    return status;
+  }
+
+  metadata.unmerged_nodes = 0;
+  metadata.merged_nodes = 0;
+  metadata.total_weight = 0;
+  metadata.merged_weight = 0;
+  metadata.minimum = std::numeric_limits<double>::max();
+  metadata.maximum = std::numeric_limits<double>::lowest();
+  metadata.total_observations = 0;
+  metadata.merge_times = 0;
+
+  std::string metadata_bytes;
+  metadata.Encode(&metadata_bytes);
+
+  if (auto status = batch->Put(metadata_cf_handle_, ns_key, metadata_bytes); !status.ok()) {
+    return status;
+  }
+
+  auto start_key = internalSegmentGuardPrefixKey(metadata, ns_key, SegmentType::kBuffer);
+  auto guard_key = internalSegmentGuardPrefixKey(metadata, ns_key, SegmentType::kGuardFlag);
+
+  if (auto status = batch->DeleteRange(cf_handle_, start_key, guard_key); !status.ok()) {
+    return status;
+  }
+  auto status = storage_->Write(ctx, storage_->DefaultWriteOptions(), batch->GetWriteBatch());
+  return status;
+}
 rocksdb::Status TDigest::GetMetaData(engine::Context& context, const Slice& digest_name, TDigestMetadata* metadata) {
   auto ns_key = AppendNamespacePrefix(digest_name);
   return Database::GetMetadata(context, {kRedisTDigest}, ns_key, metadata);
@@ -279,8 +320,6 @@ rocksdb::Status TDigest::mergeCurrentBuffer(engine::Context& ctx, const std::str
   metadata->merge_times++;
   metadata->merged_nodes = merged_centroids->centroids.size();
   metadata->unmerged_nodes = 0;
-  metadata->minimum = merged_centroids->min;
-  metadata->maximum = merged_centroids->max;
   metadata->merged_weight = static_cast<uint64_t>(merged_centroids->total_weight);
 
   return rocksdb::Status::OK();
@@ -293,10 +332,13 @@ std::string TDigest::internalBufferKey(const std::string& ns_key, const TDigestM
 }
 
 std::string TDigest::internalKeyFromCentroid(const std::string& ns_key, const TDigestMetadata& metadata,
-                                             const Centroid& centroid) const {
+                                             const Centroid& centroid, uint32_t seq) const {
   std::string sub_key;
   PutFixed8(&sub_key, static_cast<uint8_t>(SegmentType::kCentroids));
   PutDouble(&sub_key, centroid.mean);  // It uses EncodeDoubleToUInt64 and keeps original order of double
+  // The tdigest centroids only cares about the weight rather than the mean, so different centroids may have same mean,
+  // we should keep them with same original order, this seq id could be discarded in decode
+  PutFixed32(&sub_key, seq);
   return InternalKey(ns_key, sub_key, metadata.version, storage_->IsSlotIdEncoded()).Encode();
 }
 
@@ -312,22 +354,25 @@ rocksdb::Status TDigest::decodeCentroidFromKeyValue(const rocksdb::Slice& key, c
   auto subkey = ikey.GetSubKey();
   auto type_flg = static_cast<uint8_t>(SegmentType::kGuardFlag);
   if (!GetFixed8(&subkey, &type_flg)) {
-    LOG(ERROR) << "corrupted tdigest centroid key, extract type failed";
+    error("corrupted tdigest centroid key, extract type failed");
     return rocksdb::Status::Corruption("corrupted tdigest centroid key");
   }
   if (static_cast<SegmentType>(type_flg) != SegmentType::kCentroids) {
-    LOG(ERROR) << "corrupted tdigest centroid key type: " << type_flg << ", expect to be "
-               << static_cast<uint8_t>(SegmentType::kCentroids);
+    error("corrupted tdigest centroid key type: {}, expect to be {}", type_flg,
+          static_cast<uint8_t>(SegmentType::kCentroids));
     return rocksdb::Status::Corruption("corrupted tdigest centroid key type");
   }
   if (!GetDouble(&subkey, &centroid->mean)) {
-    LOG(ERROR) << "corrupted tdigest centroid key, extract mean failed";
+    error("corrupted tdigest centroid key, extract mean failed");
     return rocksdb::Status::Corruption("corrupted tdigest centroid key");
   }
 
+  // The seq id after mean is not used in tdigest, but it is used to keep the original order of the centroids, so
+  // discard it for simplicity
+
   if (rocksdb::Slice value_slice = value;  // GetDouble needs a mutable pointer of slice
       !GetDouble(&value_slice, &centroid->weight)) {
-    LOG(ERROR) << "corrupted tdigest centroid value, extract weight failed";
+    error("corrupted tdigest centroid value, extract weight failed");
     return rocksdb::Status::Corruption("corrupted tdigest centroid value");
   }
   return rocksdb::Status::OK();
@@ -374,7 +419,7 @@ rocksdb::Status TDigest::dumpCentroidsAndBuffer(engine::Context& ctx, const std:
       for (uint64_t i = 0; i < metadata.unmerged_nodes; ++i) {
         double tmp_value = std::numeric_limits<double>::quiet_NaN();
         if (!GetDouble(&buffer_slice, &tmp_value)) {
-          LOG(ERROR) << "metadata has " << metadata.unmerged_nodes << " records, but get " << i << " failed";
+          error("metadata has {} records, but get {} failed", metadata.unmerged_nodes, i);
           return rocksdb::Status::Corruption("corrupted tdigest buffer value");
         }
         buffer->emplace_back(tmp_value);
@@ -415,7 +460,7 @@ rocksdb::Status TDigest::dumpCentroidsAndBuffer(engine::Context& ctx, const std:
   }
 
   if (centroids->size() != metadata.merged_nodes) {
-    LOG(ERROR) << "metadata has " << metadata.merged_nodes << " merged nodes, but got " << centroids->size();
+    error("metadata has {} merged nodes, but got {}", metadata.merged_nodes, centroids->size());
     return rocksdb::Status::Corruption("centroids count mismatch with metadata");
   }
   return rocksdb::Status::OK();
@@ -424,8 +469,9 @@ rocksdb::Status TDigest::dumpCentroidsAndBuffer(engine::Context& ctx, const std:
 rocksdb::Status TDigest::applyNewCentroids(ObserverOrUniquePtr<rocksdb::WriteBatchBase>& batch,
                                            const std::string& ns_key, const TDigestMetadata& metadata,
                                            const std::vector<Centroid>& centroids) {
-  for (const auto& c : centroids) {
-    auto centroid_key = internalKeyFromCentroid(ns_key, metadata, c);
+  for (size_t i = 0; i < centroids.size(); ++i) {
+    const auto& c = centroids[i];
+    auto centroid_key = internalKeyFromCentroid(ns_key, metadata, c, i);
     auto centroid_payload = internalValueFromCentroid(c);
     if (auto status = batch->Put(cf_handle_, centroid_key, centroid_payload); !status.ok()) {
       return status;
